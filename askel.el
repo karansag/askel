@@ -41,7 +41,7 @@
   '((pi
      :command "pi"
      :args ("--tools" "read,bash,grep,find,ls" "--thinking" "low" "--no-context-files" "-p")
-     :model nil
+     :model "z-ai/glm-5.2"         ; `pi --list-models' shows others
      :model-flag "--model")
     (claude
      :command "claude"
@@ -51,7 +51,17 @@
     (codex
      :command "codex"
      :args ("exec" "--skip-git-repo-check" "-c" "model_reasoning_effort=low")
-     :model "gpt-5.4"
+     :model "gpt-5.4"              ; "gpt-5.4-mini" is smaller/faster
+     :model-flag "--model"
+     ;; `codex exec' floods stdout with session logs; read the clean final
+     ;; message from a file instead.  See `askel--output-file-flag'.
+     :output-file-flag "--output-last-message")
+    (opencode
+     ;; Untested here (opencode not installed); flags follow the documented
+     ;; `opencode run --model provider/model' interface.  Adjust as needed.
+     :command "opencode"
+     :args ("run")
+     :model "anthropic/claude-haiku-4-5"
      :model-flag "--model"))
   "Built-in agent CLI presets for `askel-now'.
 
@@ -266,8 +276,24 @@ Signal a `user-error' if `askel-agent' names no known preset."
   (or (cdr (assq askel-agent askel-agents))
       (user-error "Unknown askel agent: %S (not in `askel-agents')" askel-agent)))
 
-(defun askel--command-list (prompt)
-  "Build the full command list (program, args, model, PROMPT) for `askel-agent'."
+(defun askel--output-file-flag ()
+  "Return the active preset's :output-file-flag, or nil.
+Agents whose stdout is too noisy to parse (e.g. `codex exec') write their
+final message to this file instead."
+  (and (not (eq askel-agent 'custom))
+       (plist-get (askel--preset) :output-file-flag)))
+
+(defun askel--read-file (file)
+  "Return the contents of FILE as a string, or nil if unreadable."
+  (when (and file (file-readable-p file))
+    (with-temp-buffer
+      (insert-file-contents file)
+      (buffer-string))))
+
+(defun askel--command-list (prompt &optional output-file)
+  "Build the command list (program, args, model, PROMPT) for `askel-agent'.
+When the active preset has an :output-file-flag and OUTPUT-FILE is non-nil,
+insert that flag so the agent writes its final message to OUTPUT-FILE."
   (if (eq askel-agent 'custom)
       (progn
         (unless askel-custom-command
@@ -275,10 +301,12 @@ Signal a `user-error' if `askel-agent' names no known preset."
         (append askel-custom-command (list prompt)))
     (let* ((preset (askel--preset))
            (model (or askel-model (plist-get preset :model)))
-           (model-flag (plist-get preset :model-flag)))
+           (model-flag (plist-get preset :model-flag))
+           (out-flag (plist-get preset :output-file-flag)))
       (append (list (plist-get preset :command))
               (plist-get preset :args)
               (when (and model model-flag) (list model-flag model))
+              (when (and out-flag output-file) (list out-flag output-file))
               (list prompt)))))
 
 (defun askel--json-object-alist (json)
@@ -442,7 +470,8 @@ Signal a `user-error' if `askel-agent' names no known preset."
   (setq askel--last-prompt question)
   (let* ((prompt (askel--build-prompt question))
          (output "")
-         (command (askel--command-list prompt)))
+         (out-file (and (askel--output-file-flag) (make-temp-file "askel-out")))
+         (command (askel--command-list prompt out-file)))
     (when (process-live-p askel--last-process)
       (delete-process askel--last-process))
     (askel--show-started question)
@@ -456,16 +485,21 @@ Signal a `user-error' if `askel-agent' names no known preset."
                      (setq output (concat output chunk)))
            :sentinel (lambda (proc _event)
                        (when (memq (process-status proc) '(exit signal))
-                         (if (= (process-exit-status proc) 0)
-                             (askel--handle-response question output)
-                           (with-current-buffer (askel--buffer)
-                             (let ((inhibit-read-only t))
-                               (erase-buffer)
-                               (insert "Agent failed.\n\n")
-                               (insert "Command: "
-                                       (mapconcat #'identity command " ")
-                                       "\n\n")
-                               (insert output))))))))))
+                         (unwind-protect
+                             (if (= (process-exit-status proc) 0)
+                                 (askel--handle-response
+                                  question
+                                  (or (and out-file (askel--read-file out-file))
+                                      output))
+                               (with-current-buffer (askel--buffer)
+                                 (let ((inhibit-read-only t))
+                                   (erase-buffer)
+                                   (insert "Agent failed.\n\n")
+                                   (insert "Command: "
+                                           (mapconcat #'identity command " ")
+                                           "\n\n")
+                                   (insert output))))
+                           (when out-file (ignore-errors (delete-file out-file))))))))))
 
 ;;;###autoload
 (defun askel-set-agent (agent)

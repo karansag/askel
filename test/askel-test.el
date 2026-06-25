@@ -11,11 +11,19 @@
 ;;; askel--command-list: preset wiring -------------------------------------
 
 (ert-deftest askel-command-list-pi ()
-  "The pi preset passes no model flag and appends the prompt last."
+  "The pi preset passes its GLM model and appends the prompt last."
   (let ((askel-agent 'pi) (askel-model nil))
     (should (equal (askel--command-list "PROMPT")
                    '("pi" "--tools" "read,bash,grep,find,ls"
-                     "--thinking" "low" "--no-context-files" "-p" "PROMPT")))))
+                     "--thinking" "low" "--no-context-files" "-p"
+                     "--model" "z-ai/glm-5.2" "PROMPT")))))
+
+(ert-deftest askel-command-list-opencode ()
+  "The opencode preset runs `run' with its provider/model."
+  (let ((askel-agent 'opencode) (askel-model nil))
+    (should (equal (askel--command-list "PROMPT")
+                   '("opencode" "run" "--model" "anthropic/claude-haiku-4-5"
+                     "PROMPT")))))
 
 (ert-deftest askel-command-list-claude ()
   "The claude preset injects its default model via --model."
@@ -30,6 +38,18 @@
                    '("codex" "exec" "--skip-git-repo-check"
                      "-c" "model_reasoning_effort=low"
                      "--model" "gpt-5.4" "PROMPT")))))
+
+(ert-deftest askel-command-list-codex-output-file ()
+  "Codex inserts its :output-file-flag when an output file is supplied."
+  (let ((askel-agent 'codex) (askel-model nil))
+    (should (equal (askel--command-list "PROMPT" "/tmp/out")
+                   '("codex" "exec" "--skip-git-repo-check"
+                     "-c" "model_reasoning_effort=low"
+                     "--model" "gpt-5.4"
+                     "--output-last-message" "/tmp/out" "PROMPT")))
+    ;; pi has no :output-file-flag, so the file is ignored.
+    (let ((askel-agent 'pi))
+      (should-not (member "/tmp/out" (askel--command-list "PROMPT" "/tmp/out"))))))
 
 (ert-deftest askel-command-list-model-override ()
   "`askel-model' overrides the preset's default model."
