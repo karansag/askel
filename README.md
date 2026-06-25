@@ -9,9 +9,31 @@ it first (`e`), open the full `*askel*` buffer (`b`), or skip (`n`).
 
 ## Requirements
 
-- An agent CLI on your `PATH`. By default this is the [`pi`](https://example.invalid)
-  command (`askel-agent-command`); point that variable at your own agent if you
-  use a different one.
+An agent CLI on your `PATH`. askel ships presets for three:
+
+| Agent | `askel-agent` | Default model | Notes |
+|-------|---------------|---------------|-------|
+| pi (default) | `pi` | agent default | tool-enabled local agent |
+| Claude | `claude` | `sonnet` | set `askel-model` to `haiku` for lower latency |
+| Codex | `codex` | `gpt-5.4` | runs `codex exec` with `model_reasoning_effort=low` |
+
+Whichever preset is active, that CLI must be installed. Switch interactively
+with `M-x askel-set-agent` and `M-x askel-set-model`, or set the variables:
+
+```elisp
+(setq askel-agent 'claude)   ; pi | claude | codex | custom
+(setq askel-model "haiku")   ; nil = use the preset's default model
+```
+
+For anything else, set `askel-agent` to `custom` and give the full command in
+`askel-custom-command` (the prompt is appended as the last argument):
+
+```elisp
+(setq askel-agent 'custom
+      askel-custom-command '("my-agent" "--model" "foo" "-p"))
+```
+
+Add or edit presets in `askel-agents`.
 
 ## Install
 

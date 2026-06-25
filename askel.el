@@ -13,9 +13,15 @@
 
 ;; Ask in natural language; get an executable Emacs Lisp or shell command back.
 ;;
-;; Requires the `pi' CLI on your PATH (see `askel-agent-command').  Without it,
-;; `askel-now' will fail with "pi: command not found"; point that variable at
-;; your own agent command if you use a different one.
+;; askel shells out to a CLI agent.  Choose one with `askel-agent' -- the
+;; built-in presets in `askel-agents' are `pi', `claude', and `codex' -- or set
+;; it to `custom' and provide `askel-custom-command'.  Override the model with
+;; `askel-model'.  Switch interactively with M-x `askel-set-agent' and
+;; `askel-set-model'.
+;;
+;; The default agent is `pi', so that CLI must be on your PATH; otherwise
+;; `askel-now' fails with "pi: command not found".  Each preset's command must
+;; likewise be installed for that agent to work.
 ;;
 ;; Privacy: each askel sends a prefix of your `~/.emacs.el', the current buffer,
 ;; and any active region to the agent as context.
@@ -31,22 +37,49 @@
   "Ask an external agent for executable Emacs commands."
   :group 'tools)
 
-(defcustom askel-agent-command "pi"
-  "Program used by `askel-now'."
-  :type 'string)
+(defcustom askel-agents
+  '((pi
+     :command "pi"
+     :args ("--tools" "read,bash,grep,find,ls" "--thinking" "low" "--no-context-files" "-p")
+     :model nil
+     :model-flag "--model")
+    (claude
+     :command "claude"
+     :args ("-p")
+     :model "sonnet"               ; "haiku" is faster/cheaper
+     :model-flag "--model")
+    (codex
+     :command "codex"
+     :args ("exec" "--skip-git-repo-check" "-c" "model_reasoning_effort=low")
+     :model "gpt-5.4"
+     :model-flag "--model"))
+  "Built-in agent CLI presets for `askel-now'.
 
-(defcustom askel-agent-arguments
-  '("--tools" "read,bash,grep,find,ls" "--thinking" "low" "--no-context-files" "-p")
-  "Arguments passed to `askel-agent-command' before the prompt.
+An alist mapping a preset key (symbol) to a plist with:
+  :command     program to run (must be on `exec-path')
+  :args        fixed arguments placed before the prompt
+  :model       default model string, or nil for the agent's own default
+  :model-flag  flag used to pass the model (e.g. \"--model\")
+The prompt is always appended as the final argument.  Select the active
+preset with `askel-agent'."
+  :type '(alist :key-type symbol :value-type plist))
 
-Keep this read-only unless you explicitly want the agent to edit files.
-The final prompt is appended as one argument."
+(defcustom askel-agent 'pi
+  "Active agent for `askel-now'.
+Either a key in `askel-agents', or `custom' to use `askel-custom-command'."
+  :type 'symbol)
+
+(defcustom askel-model nil
+  "Model override for the active agent.
+When nil, use the active preset's :model.  Set to a string (e.g. \"haiku\")
+to override it without editing `askel-agents'."
+  :type '(choice (const :tag "Preset default" nil) string))
+
+(defcustom askel-custom-command nil
+  "Command list used when `askel-agent' is `custom'.
+A list of strings; the prompt is appended as the final argument.
+Example: (\"my-agent\" \"--model\" \"foo\" \"-p\")."
   :type '(repeat string))
-
-(defcustom askel-agent-model nil
-  "Optional model passed to the agent with --model.
-Leave nil to use the agent's configured default."
-  :type '(choice (const :tag "Agent default" nil) string))
 
 (defcustom askel-config-file (expand-file-name "~/.emacs.el")
   "Emacs config file included in askel context."
@@ -227,12 +260,26 @@ User request:
           (askel--emacs-context)
           question))
 
+(defun askel--preset ()
+  "Return the plist for the active agent preset.
+Signal a `user-error' if `askel-agent' names no known preset."
+  (or (cdr (assq askel-agent askel-agents))
+      (user-error "Unknown askel agent: %S (not in `askel-agents')" askel-agent)))
+
 (defun askel--command-list (prompt)
-  (append (list askel-agent-command)
-          (when askel-agent-model
-            (list "--model" askel-agent-model))
-          askel-agent-arguments
-          (list prompt)))
+  "Build the full command list (program, args, model, PROMPT) for `askel-agent'."
+  (if (eq askel-agent 'custom)
+      (progn
+        (unless askel-custom-command
+          (user-error "`askel-agent' is `custom' but `askel-custom-command' is unset"))
+        (append askel-custom-command (list prompt)))
+    (let* ((preset (askel--preset))
+           (model (or askel-model (plist-get preset :model)))
+           (model-flag (plist-get preset :model-flag)))
+      (append (list (plist-get preset :command))
+              (plist-get preset :args)
+              (when (and model model-flag) (list model-flag model))
+              (list prompt)))))
 
 (defun askel--json-object-alist (json)
   (let ((json-object-type 'alist)
@@ -419,6 +466,34 @@ User request:
                                        (mapconcat #'identity command " ")
                                        "\n\n")
                                (insert output))))))))))
+
+;;;###autoload
+(defun askel-set-agent (agent)
+  "Switch the active AGENT (a key in `askel-agents', or `custom').
+Resets `askel-model' so the new preset's default model is used."
+  (interactive
+   (list (intern
+          (completing-read
+           "Askel agent: "
+           (append (mapcar (lambda (e) (symbol-name (car e))) askel-agents)
+                   '("custom"))
+           nil t))))
+  (setq askel-agent agent
+        askel-model nil)
+  (message "Askel agent: %s (model: %s)"
+           agent
+           (or (and (not (eq agent 'custom)) (plist-get (askel--preset) :model))
+               "default")))
+
+;;;###autoload
+(defun askel-set-model (model)
+  "Override the MODEL for the active agent.
+Blank input restores the preset default."
+  (interactive (list (read-string "Askel model (blank = preset default): "
+                                  (or askel-model ""))))
+  (setq askel-model (let ((m (string-trim model)))
+                      (unless (string-empty-p m) m)))
+  (message "Askel model: %s" (or askel-model "preset default")))
 
 ;;;###autoload
 (defun askel-reply (question)
