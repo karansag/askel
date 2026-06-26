@@ -22,8 +22,17 @@
   "The opencode preset runs `run' with its provider/model."
   (let ((askel-agent 'opencode) (askel-model nil))
     (should (equal (askel--command-list "PROMPT")
-                   '("opencode" "run" "--model" "anthropic/claude-haiku-4-5"
+                   '("opencode" "run" "--model" "openrouter/z-ai/glm-5.2"
                      "PROMPT")))))
+
+(ert-deftest askel-agent-label ()
+  "The agent label combines agent and effective model."
+  (let ((askel-agent 'claude) (askel-model nil))
+    (should (equal (askel--agent-label) "claude/sonnet")))
+  (let ((askel-agent 'claude) (askel-model "haiku"))
+    (should (equal (askel--agent-label) "claude/haiku")))
+  (let ((askel-agent 'custom) (askel-custom-command '("x")))
+    (should (equal (askel--agent-label) "custom"))))
 
 (ert-deftest askel-command-list-claude ()
   "The claude preset injects its default model via --model."

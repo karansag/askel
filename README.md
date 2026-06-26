@@ -16,10 +16,11 @@ An agent CLI on your `PATH`. askel ships presets for three:
 | pi (default) | `pi` | `z-ai/glm-5.2` | tool-enabled agent; `pi --list-models` shows others |
 | Claude | `claude` | `sonnet` | set `askel-model` to `haiku` for lower latency |
 | Codex | `codex` | `gpt-5.4` | `codex exec`, low reasoning; reads the clean reply via `--output-last-message` |
-| OpenCode | `opencode` | `anthropic/claude-haiku-4-5` | needs the `opencode` CLI; preset untested |
+| OpenCode | `opencode` | `openrouter/z-ai/glm-5.2` | `opencode run`; needs the `opencode` CLI on `PATH` |
 
-Verified working end-to-end: `pi`, `claude`, `codex`. The `opencode` preset
-follows the documented `opencode run --model …` interface but was not tested.
+All four presets — `pi`, `claude`, `codex`, `opencode` — are verified working
+end-to-end. After each query, the `*askel*` buffer and minibuffer prompt show a
+timing line (e.g. `claude/haiku · 6.6s`) so you can compare agents and models.
 
 Whichever preset is active, that CLI must be installed. Switch interactively
 with `M-x askel-set-agent` and `M-x askel-set-model`, or set the variables:

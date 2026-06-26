@@ -57,11 +57,9 @@
      ;; message from a file instead.  See `askel--output-file-flag'.
      :output-file-flag "--output-last-message")
     (opencode
-     ;; Untested here (opencode not installed); flags follow the documented
-     ;; `opencode run --model provider/model' interface.  Adjust as needed.
      :command "opencode"
      :args ("run")
-     :model "anthropic/claude-haiku-4-5"
+     :model "openrouter/z-ai/glm-5.2"   ; `opencode models' lists the rest
      :model-flag "--model"))
   "Built-in agent CLI presets for `askel-now'.
 
@@ -115,6 +113,8 @@ buffer."
 (defvar askel--last-process nil)
 (defvar askel--last-prompt nil)
 (defvar askel--last-response nil)
+(defvar askel--last-timing nil
+  "Timing string for the most recent response, e.g. \"claude/sonnet · 5.8s\".")
 (defvar askel--last-command-language nil)
 (defvar askel--last-command-code nil)
 (defvar askel--last-command-description nil)
@@ -276,6 +276,13 @@ Signal a `user-error' if `askel-agent' names no known preset."
   (or (cdr (assq askel-agent askel-agents))
       (user-error "Unknown askel agent: %S (not in `askel-agents')" askel-agent)))
 
+(defun askel--agent-label ()
+  "Return a short \"agent/model\" label for the active agent."
+  (let ((model (or askel-model
+                   (and (not (eq askel-agent 'custom))
+                        (plist-get (askel--preset) :model)))))
+    (if model (format "%s/%s" askel-agent model) (format "%s" askel-agent))))
+
 (defun askel--output-file-flag ()
   "Return the active preset's :output-file-flag, or nil.
 Agents whose stdout is too noisy to parse (e.g. `codex exec') write their
@@ -385,6 +392,8 @@ insert that flag so the agent writes its final message to OUTPUT-FILE."
             command-button)
         (erase-buffer)
         (insert (propertize "Askel\n" 'face '(:height 1.2 :weight bold)))
+        (when askel--last-timing
+          (insert (propertize (concat askel--last-timing "\n") 'face 'shadow)))
         (insert "\n")
         (insert (propertize "Request:\n" 'face 'bold))
         (insert prompt "\n\n")
@@ -438,7 +447,10 @@ insert that flag so the agent writes its final message to OUTPUT-FILE."
                 (language (or (plist-get command :language) "elisp"))
                 (description (plist-get command :description))
                 (choice (read-char-choice
-                         (format "%s%s\nRun (%s): %s\n[y] run  [e] edit  [b] buffer  [n] no: "
+                         (format "%s%s%s\nRun (%s): %s\n[y] run  [e] edit  [b] buffer  [n] no: "
+                                 (if askel--last-timing
+                                     (concat askel--last-timing "\n")
+                                   "")
                                  (or answer "Agent returned a command.")
                                  (if (and description (not (string-empty-p description)))
                                      (concat "\n" description)
@@ -451,7 +463,9 @@ insert that flag so the agent writes its final message to OUTPUT-FILE."
              (?e (askel-edit-last-command))
              (?b (askel--show-buffer prompt raw))
              (?n (message "Askel command skipped."))))))
-    (message "%s" (or answer "Askel completed without a command."))))
+    (message "%s%s"
+             (if askel--last-timing (concat askel--last-timing "  ") "")
+             (or answer "Askel completed without a command."))))
 
 (defun askel--show-started (question)
   (if (eq askel-display-mode 'buffer)
@@ -471,7 +485,9 @@ insert that flag so the agent writes its final message to OUTPUT-FILE."
   (let* ((prompt (askel--build-prompt question))
          (output "")
          (out-file (and (askel--output-file-flag) (make-temp-file "askel-out")))
-         (command (askel--command-list prompt out-file)))
+         (command (askel--command-list prompt out-file))
+         (label (askel--agent-label))
+         (start (float-time)))
     (when (process-live-p askel--last-process)
       (delete-process askel--last-process))
     (askel--show-started question)
@@ -487,10 +503,14 @@ insert that flag so the agent writes its final message to OUTPUT-FILE."
                        (when (memq (process-status proc) '(exit signal))
                          (unwind-protect
                              (if (= (process-exit-status proc) 0)
-                                 (askel--handle-response
-                                  question
-                                  (or (and out-file (askel--read-file out-file))
-                                      output))
+                                 (progn
+                                   (setq askel--last-timing
+                                         (format "%s · %.1fs" label
+                                                 (- (float-time) start)))
+                                   (askel--handle-response
+                                    question
+                                    (or (and out-file (askel--read-file out-file))
+                                        output)))
                                (with-current-buffer (askel--buffer)
                                  (let ((inhibit-read-only t))
                                    (erase-buffer)
