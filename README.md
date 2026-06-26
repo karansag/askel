@@ -93,6 +93,22 @@ Other commands:
 - `M-x askel-reply` — ask a follow-up about the previous response.
 - `M-x askel-retry` — re-run the last request.
 - `M-x askel-set-agent` / `M-x askel-set-model` — switch agent / model.
+- `M-x askel-show-log` — open the running log of past queries.
+
+### Log buffer
+
+Every query appends an entry to `*askel-log*` (timestamp, agent/model, timing,
+the question, and the resulting command), so you have a persistent record and
+can compare agents over time:
+
+```
+[2026-06-25 21:30:14] claude/sonnet · 4.9s
+  Q: make the font bigger
+  → (text-scale-increase 2)
+```
+
+Open it with `M-x askel-show-log`. Set `askel-log-buffer` to nil to disable
+logging, or to another name to relocate it.
 
 ## Configuration
 
@@ -124,6 +140,7 @@ a file instead).
 | `askel-agents` | (4 presets) | the preset definitions |
 | `askel-custom-command` | `nil` | command list for the `custom` agent |
 | `askel-display-mode` | `minibuffer` | `minibuffer` or `buffer` |
+| `askel-log-buffer` | `*askel-log*` | running query log; nil to disable |
 | `askel-config-file` | `~/.emacs.el` | config file sent as context |
 | `askel-context-max-config-chars` | `24000` | cap on config chars sent (0 to disable) |
 | `askel-context-max-buffer-chars` | `4000` | cap on current-buffer chars sent |

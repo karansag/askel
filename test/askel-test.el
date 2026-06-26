@@ -102,5 +102,28 @@
 (ert-deftest askel-parse-response-garbage-is-nil ()
   (should (null (askel--parse-response "not json at all"))))
 
+;;; askel--log ------------------------------------------------------------
+
+(ert-deftest askel-log-appends-entry ()
+  "`askel--log' appends the question and command code to the log buffer."
+  (let ((askel-log-buffer "*askel-log-test*")
+        (askel--last-timing "claude/sonnet · 1.0s"))
+    (unwind-protect
+        (progn
+          (askel--log "make the font bigger"
+                      '(:language "elisp" :code "(text-scale-increase 2)"))
+          (with-current-buffer askel-log-buffer
+            (let ((s (buffer-string)))
+              (should (string-match-p "make the font bigger" s))
+              (should (string-match-p "(text-scale-increase 2)" s))
+              (should (string-match-p "claude/sonnet" s)))))
+      (when (get-buffer "*askel-log-test*")
+        (kill-buffer "*askel-log-test*")))))
+
+(ert-deftest askel-log-disabled-is-noop ()
+  "Logging is a no-op when `askel-log-buffer' is nil."
+  (let ((askel-log-buffer nil))
+    (should (null (askel--log "q" nil)))))
+
 (provide 'askel-test)
 ;;; askel-test.el ends here

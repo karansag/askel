@@ -109,6 +109,12 @@ buffer."
   :type '(choice (const :tag "Minibuffer prompt" minibuffer)
                  (const :tag "Askel buffer" buffer)))
 
+(defcustom askel-log-buffer "*askel-log*"
+  "Name of the buffer that accumulates askel queries, timings, and commands.
+Each `askel-now' response appends one entry here; view it with
+`askel-show-log'.  Set to nil to disable logging."
+  :type '(choice (const :tag "Disabled" nil) string))
+
 (defvar askel--history nil)
 (defvar askel--last-process nil)
 (defvar askel--last-prompt nil)
@@ -421,6 +427,21 @@ insert that flag so the agent writes its final message to OUTPUT-FILE."
 (defun askel--show-buffer (prompt raw)
   (askel--render prompt raw))
 
+(defun askel--log (question command)
+  "Append a record of QUESTION and its COMMAND to `askel-log-buffer'.
+COMMAND is the parsed command plist, or nil.  No-op when logging is disabled."
+  (when askel-log-buffer
+    (with-current-buffer (get-buffer-create askel-log-buffer)
+      (special-mode)
+      (let ((inhibit-read-only t))
+        (goto-char (point-max))
+        (insert (format-time-string "[%Y-%m-%d %H:%M:%S] ")
+                (or askel--last-timing "")
+                "\n  Q: " (string-trim question) "\n")
+        (when command
+          (insert "  → " (or (plist-get command :code) "") "\n"))
+        (insert "\n")))))
+
 (defun askel--handle-response (prompt raw)
   (let* ((parsed (askel--parse-response raw))
          (answer (and parsed (askel--alist-get 'answer parsed)))
@@ -432,6 +453,7 @@ insert that flag so the agent writes its final message to OUTPUT-FILE."
     (when command
       (askel--remember-command command))
     (push (list :prompt prompt :response raw) askel--history)
+    (askel--log prompt command)
     (if (eq askel-display-mode 'buffer)
         (askel--show-buffer prompt raw)
       (if parsed
@@ -570,6 +592,18 @@ Blank input restores the preset default."
   (unless askel--last-response
     (user-error "No askel response yet"))
   (askel--show-buffer (or askel--last-prompt "") askel--last-response))
+
+;;;###autoload
+(defun askel-show-log ()
+  "Show `askel-log-buffer', the running log of askel queries and timings."
+  (interactive)
+  (unless askel-log-buffer
+    (user-error "Logging is disabled (`askel-log-buffer' is nil)"))
+  (let ((buf (get-buffer askel-log-buffer)))
+    (unless buf
+      (user-error "No askel queries logged yet"))
+    (with-current-buffer buf (goto-char (point-max)))
+    (pop-to-buffer buf)))
 
 ;;;###autoload
 (defun askel-run-last-command ()
