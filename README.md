@@ -1,62 +1,150 @@
 # askel.el
 
-Ask Emacs for things in natural language; get back an executable Emacs Lisp or
-shell command that you confirm before it runs.
+Ask Emacs for things in plain English; get back an executable Emacs Lisp or
+shell command that you read and confirm before it runs.
 
-`M-x askel-now`, type a request (e.g. *"split the window and open my init file"*),
-and the agent returns a command. From the minibuffer you can run it (`y`), edit
-it first (`e`), open the full `*askel*` buffer (`b`), or skip (`n`).
+```
+M-x askel-now RET  split the window and open my init file RET
 
-## Requirements
+  claude/sonnet · 4.9s
+  Splits the window and opens your Emacs init file.
+  Run (elisp): (progn (split-window-right) (find-file user-init-file))
+  [y] run  [e] edit  [b] buffer  [n] no:
+```
 
-An agent CLI on your `PATH`. askel ships presets for three:
+## Features
+
+- **Natural language → a real command**, shown before it runs.
+- **Pluggable agents.** Built-in presets for `pi`, `claude`, `codex`, and
+  `opencode`; switch agent and model on the fly, or plug in your own CLI.
+- **Follow-ups with history.** Ask a follow-up and the previous exchange is
+  included as context.
+- **Confirm-before-run.** Run, edit-then-run, inspect, or skip every command.
+- **Per-query timing** (`agent/model · N.Ns`) so you can compare agents.
+
+## Install
+
+askel is a single file. Put it on your `load-path` and require it:
+
+```elisp
+(add-to-list 'load-path "/path/to/askel")
+(require 'askel)
+
+;; Optional: a global key for the main entry point.
+(global-set-key (kbd "C-c a") #'askel-now)
+```
+
+With `use-package`:
+
+```elisp
+(use-package askel
+  :load-path "/path/to/askel"
+  :bind ("C-c a" . askel-now))
+```
+
+## Agents
+
+askel shells out to a CLI agent. Whichever preset is active, that CLI must be
+installed and on Emacs's `exec-path`.
 
 | Agent | `askel-agent` | Default model | Notes |
 |-------|---------------|---------------|-------|
-| pi (default) | `pi` | `z-ai/glm-5.2` | tool-enabled agent; `pi --list-models` shows others |
+| Pi (default) | `pi` | `z-ai/glm-5.2` | tool-enabled agent; `pi --list-models` lists others |
 | Claude | `claude` | `sonnet` | set `askel-model` to `haiku` for lower latency |
-| Codex | `codex` | `gpt-5.4` | `codex exec`, low reasoning; reads the clean reply via `--output-last-message` |
-| OpenCode | `opencode` | `openrouter/z-ai/glm-5.2` | `opencode run`; needs the `opencode` CLI on `PATH` |
+| Codex | `codex` | `gpt-5.4` | `codex exec`, low reasoning; reads the reply via `--output-last-message` |
+| OpenCode | `opencode` | `openrouter/z-ai/glm-5.2` | `opencode run`; `opencode models` lists others |
 
-All four presets — `pi`, `claude`, `codex`, `opencode` — are verified working
-end-to-end. After each query, the `*askel*` buffer and minibuffer prompt show a
-timing line (e.g. `claude/haiku · 6.6s`) so you can compare agents and models.
+All four presets are verified working end-to-end.
 
-Whichever preset is active, that CLI must be installed. Switch interactively
-with `M-x askel-set-agent` and `M-x askel-set-model`, or set the variables:
+If an agent lives outside your default `PATH` (e.g. OpenCode under
+`~/.opencode/bin`), add it to `exec-path`:
 
 ```elisp
-(setq askel-agent 'claude)   ; pi | claude | codex | custom
-(setq askel-model "haiku")   ; nil = use the preset's default model
+(add-to-list 'exec-path (expand-file-name "~/.opencode/bin"))
 ```
 
-For anything else, set `askel-agent` to `custom` and give the full command in
-`askel-custom-command` (the prompt is appended as the last argument):
+## Usage
+
+`M-x askel-now`, type a request, and the agent replies with a command. How the
+reply is presented depends on `askel-display-mode`:
+
+- `minibuffer` (default) — a one-line prompt with the command and these keys:
+
+  | Key | Action |
+  |-----|--------|
+  | `y` | run the command |
+  | `e` | edit it first, then run |
+  | `b` | open the full `*askel*` buffer |
+  | `n` | skip |
+
+- `buffer` — always show the `*askel*` buffer, which has its own keys:
+
+  | Key | Command | Action |
+  |-----|---------|--------|
+  | `RET` | `askel-run-last-command` | run the command |
+  | `e` | `askel-edit-last-command` | edit, then run |
+  | `r` | `askel-reply` | ask a follow-up (keeps history) |
+  | `g` | `askel-retry` | re-run the last request |
+  | `b` | `askel-show-last-response` | redisplay the last response |
+  | `q` | `quit-window` | close the buffer |
+
+Other commands:
+
+- `M-x askel-reply` — ask a follow-up about the previous response.
+- `M-x askel-retry` — re-run the last request.
+- `M-x askel-set-agent` / `M-x askel-set-model` — switch agent / model.
+
+## Configuration
+
+Switch agent and model interactively (`askel-set-agent` / `askel-set-model`) or
+set the variables in your init:
+
+```elisp
+(setq askel-agent 'claude)   ; pi | claude | codex | opencode | custom
+(setq askel-model "haiku")   ; nil = use the active preset's default model
+```
+
+For any other CLI, use the `custom` agent and give the full command — the prompt
+is appended as the final argument:
 
 ```elisp
 (setq askel-agent 'custom
       askel-custom-command '("my-agent" "--model" "foo" "-p"))
 ```
 
-Add or edit presets in `askel-agents`.
+Add or edit presets directly in `askel-agents`. Each preset is a plist with
+`:command`, `:args`, `:model`, `:model-flag`, and optionally `:output-file-flag`
+(for agents whose stdout is too noisy to parse — the final message is read from
+a file instead).
 
-## Install
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `askel-agent` | `pi` | active agent preset, or `custom` |
+| `askel-model` | `nil` | model override for the active agent |
+| `askel-agents` | (4 presets) | the preset definitions |
+| `askel-custom-command` | `nil` | command list for the `custom` agent |
+| `askel-display-mode` | `minibuffer` | `minibuffer` or `buffer` |
+| `askel-config-file` | `~/.emacs.el` | config file sent as context |
+| `askel-context-max-config-chars` | `24000` | cap on config chars sent (0 to disable) |
+| `askel-context-max-buffer-chars` | `4000` | cap on current-buffer chars sent |
 
-```elisp
-(add-to-list 'load-path "/path/to/askel")
-(require 'askel)
-```
+## How it works
 
-## Privacy
-
-Each askel sends a prefix of your `~/.emacs.el`, the current buffer, and any
-active region to the agent as context. See `askel-context-max-config-chars` and
-`askel-context-max-buffer-chars` to bound or disable this.
+askel builds a prompt (your request + Emacs context), runs the agent CLI with
+it, and asks the agent to reply as JSON describing a single command. It parses
+that, shows you the command, and runs it only when you confirm.
 
 ## Safety
 
-`askel-now` runs model-generated **elisp and shell** code. Every command is shown
-and confirmed before it executes — read it before you accept.
+`askel-now` runs model-generated **Emacs Lisp and shell** code. Every command is
+shown and confirmed before it executes — read it before you accept.
+
+## Privacy
+
+Each query sends a prefix of your `~/.emacs.el`, the current buffer, and any
+active region to the agent as context. Lower or zero out
+`askel-context-max-config-chars` / `askel-context-max-buffer-chars` to bound or
+disable this.
 
 ## License
 
