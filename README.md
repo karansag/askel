@@ -3,6 +3,8 @@
 Ask Emacs for things in plain English; get back an executable Emacs Lisp or
 shell command that you read and confirm before it runs.
 
+![askel demo](demo.gif)
+
 ```
 M-x askel-now RET  split the window and open my init file RET
 
