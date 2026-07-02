@@ -22,6 +22,10 @@
 ;; model with `askel-model'.  Switch interactively with M-x `askel-set-agent'
 ;; and `askel-set-model'.
 ;;
+;; The `pi' and `claude' presets keep one agent process alive between queries
+;; (see `askel-persistent-agent'), cutting per-query time from 20-26s to a few
+;; seconds after the first; `askel-stop-agent' shuts the process down.
+;;
 ;; The `openrouter' preset needs an API key: `askel-openrouter-api-key', the
 ;; OPENROUTER_API_KEY environment variable, or a key already stored by the pi
 ;; or opencode CLIs.  CLI presets need their command on `exec-path'.
@@ -50,12 +54,21 @@
      :command "pi"
      :args ("--tools" "read,bash,grep,find,ls" "--thinking" "low" "--no-context-files" "-p")
      :model "z-ai/glm-5.2"         ; `pi --list-models' shows others
-     :model-flag "--model")
+     :model-flag "--model"
+     ;; Long-lived `pi --mode rpc' process; saves ~10-18s/query over one-shot.
+     :rpc-command ("pi" "--mode" "rpc" "--no-session" "--no-context-files"
+                   "--tools" "read,bash,grep,find,ls" "--thinking" "low")
+     :rpc-protocol pi-rpc)
     (claude
      :command "claude"
      :args ("-p")
      :model "sonnet"               ; "haiku" is faster/cheaper
-     :model-flag "--model")
+     :model-flag "--model"
+     ;; Long-lived stream-json session; --verbose is mandatory with
+     ;; --output-format stream-json in print mode.
+     :rpc-command ("claude" "-p" "--input-format" "stream-json"
+                   "--output-format" "stream-json" "--verbose")
+     :rpc-protocol claude-stream-json)
     (codex
      :command "codex"
      :args ("exec" "--skip-git-repo-check" "-c" "model_reasoning_effort=low")
@@ -77,10 +90,12 @@ directly and take:
   :url         endpoint URL
   :model       model string sent in the request
 CLI presets shell out to an agent binary and take:
-  :command     program to run (must be on `exec-path')
-  :args        fixed arguments placed before the prompt
-  :model       default model string, or nil for the agent's own default
-  :model-flag  flag used to pass the model (e.g. \"--model\")
+  :command      program to run (must be on `exec-path')
+  :args         fixed arguments placed before the prompt
+  :model        default model string, or nil for the agent's own default
+  :model-flag   flag used to pass the model (e.g. \"--model\")
+  :rpc-command  optional command list for a persistent agent process
+  :rpc-protocol wire protocol of that process (see `askel--rpc-handle-event')
 For CLI presets the prompt is appended as the final argument.  Select
 the active preset with `askel-agent'."
   :type '(alist :key-type symbol :value-type plist))
@@ -89,6 +104,22 @@ the active preset with `askel-agent'."
   "Active agent for `askel-now'.
 Either a key in `askel-agents', or `custom' to use `askel-custom-command'."
   :type 'symbol)
+
+(defcustom askel-persistent-agent t
+  "When non-nil, keep CLI agents that support it alive between queries.
+Applies to presets with an :rpc-command (currently `pi' and `claude').
+The first query pays the usual startup cost; later ones skip process
+boot and benefit from the provider's prompt cache, typically answering
+in a few seconds instead of 20+.  Stop the process with
+`askel-stop-agent'."
+  :type 'boolean)
+
+(defcustom askel-rpc-reset-after 10
+  "Start a fresh agent session after this many persistent-agent queries.
+Each query appends its full prompt to the live session, so an unbounded
+session grows slow and expensive; resetting bounds that.  The query
+after a reset re-pays the full prompt cost once."
+  :type 'integer)
 
 (defcustom askel-openrouter-api-key nil
   "API key for the `openrouter' preset.
@@ -139,6 +170,17 @@ Each `askel-now' response appends one entry here; view it with
 (defvar askel--last-process nil)
 (defvar askel--last-url-buffer nil
   "Buffer of the in-flight HTTP request, or nil.")
+(defvar askel--rpc-process nil
+  "Long-lived agent process, or nil.")
+(defvar askel--rpc-key nil
+  "(AGENT MODEL) the persistent process was started for.")
+(defvar askel--rpc-protocol nil
+  "Wire protocol of the running persistent process.")
+(defvar askel--rpc-line-buffer "")
+(defvar askel--rpc-callback nil
+  "Function awaiting the persistent agent's reply text, or nil when idle.")
+(defvar askel--rpc-turns 0
+  "Queries answered in the persistent agent's current session.")
 (defvar askel--last-prompt nil)
 (defvar askel--last-response nil)
 (defvar askel--last-timing nil
@@ -594,9 +636,13 @@ COMMAND is the parsed command plist, or nil.  No-op when logging is disabled."
     (message "Askel: asking agent...")))
 
 (defun askel--abort-pending ()
-  "Cancel any in-flight agent request."
+  "Cancel any in-flight agent request.
+An idle persistent agent is left running; a busy one is killed and will
+be respawned by the next query."
   (when (process-live-p askel--last-process)
     (delete-process askel--last-process))
+  (when askel--rpc-callback
+    (askel--rpc-kill))
   (when (buffer-live-p askel--last-url-buffer)
     (let ((proc (get-buffer-process askel--last-url-buffer)))
       (when proc (delete-process proc)))
@@ -629,6 +675,140 @@ COMMAND is the parsed command plist, or nil.  No-op when logging is disabled."
              (if content
                  (askel--finish question label start content provider)
                (askel--show-failure "Agent failed." err)))))))
+
+(defun askel--rpc-preset-p ()
+  "Return non-nil when the active agent should run as a persistent process."
+  (and askel-persistent-agent
+       (not (eq askel-agent 'custom))
+       (plist-get (askel--preset) :rpc-command)))
+
+(defun askel--rpc-command ()
+  "Build the command list that starts the persistent agent."
+  (let* ((preset (askel--preset))
+         (model (or askel-model (plist-get preset :model)))
+         (model-flag (plist-get preset :model-flag)))
+    (append (plist-get preset :rpc-command)
+            (when (and model model-flag) (list model-flag model)))))
+
+(defun askel--rpc-send (obj)
+  "Send OBJ to the persistent agent as one JSON line."
+  (process-send-string askel--rpc-process (concat (json-encode obj) "\n")))
+
+(defun askel--rpc-kill ()
+  "Stop the persistent agent process, dropping any pending reply."
+  (setq askel--rpc-callback nil)
+  (when (process-live-p askel--rpc-process)
+    (delete-process askel--rpc-process))
+  (setq askel--rpc-process nil
+        askel--rpc-key nil
+        askel--rpc-line-buffer ""
+        askel--rpc-turns 0))
+
+(defun askel--rpc-deliver (text)
+  "Hand TEXT to the pending reply callback, consuming it."
+  (when askel--rpc-callback
+    (let ((cb askel--rpc-callback))
+      (setq askel--rpc-callback nil)
+      (funcall cb text))))
+
+(defun askel--rpc-handle-event (event)
+  "Dispatch EVENT from the persistent agent per `askel--rpc-protocol'.
+
+pi-rpc (see pi's docs/rpc.md): on \"agent_end\" ask for the final text
+with \"get_last_assistant_text\" and deliver its response.
+claude-stream-json: the \"result\" event carries the reply directly."
+  (pcase askel--rpc-protocol
+    ('pi-rpc
+     (pcase (alist-get 'type event)
+       ("agent_end"
+        (askel--rpc-send '((type . "get_last_assistant_text"))))
+       ("response"
+        (when (equal (alist-get 'command event) "get_last_assistant_text")
+          (askel--rpc-deliver (alist-get 'text (alist-get 'data event)))))))
+    ('claude-stream-json
+     (when (equal (alist-get 'type event) "result")
+       (askel--rpc-deliver (and (not (alist-get 'is_error event))
+                                (alist-get 'result event)))))))
+
+(defun askel--rpc-filter (_proc chunk)
+  (setq askel--rpc-line-buffer (concat askel--rpc-line-buffer chunk))
+  (while (string-match "\n" askel--rpc-line-buffer)
+    (let ((line (substring askel--rpc-line-buffer 0 (match-beginning 0))))
+      (setq askel--rpc-line-buffer
+            (substring askel--rpc-line-buffer (match-end 0)))
+      (let ((event (ignore-errors (askel--json-object-alist line))))
+        (when event (askel--rpc-handle-event event))))))
+
+(defun askel--rpc-sentinel (proc _event)
+  (when (memq (process-status proc) '(exit signal))
+    (let ((cb askel--rpc-callback))
+      (askel--rpc-kill)
+      (when cb
+        (askel--show-failure "Persistent agent exited." "")))))
+
+(defun askel--rpc-ensure-process ()
+  "Return a live, idle persistent agent process, (re)starting if needed.
+Restart when the agent or model changed, or when a previous query is
+still in flight (correctness over warmth)."
+  (let ((key (list askel-agent (or askel-model
+                                   (plist-get (askel--preset) :model)))))
+    (unless (and (process-live-p askel--rpc-process)
+                 (equal key askel--rpc-key)
+                 (null askel--rpc-callback))
+      (askel--rpc-kill)
+      (setq askel--rpc-key key
+            askel--rpc-protocol (plist-get (askel--preset) :rpc-protocol)
+            askel--rpc-process
+            (make-process
+             :name "askel-rpc"
+             :buffer nil
+             :command (askel--rpc-command)
+             :noquery t
+             :coding 'utf-8-unix
+             ;; A pty truncates our multi-kilobyte JSON lines at the tty
+             ;; line-buffer limit (4096 bytes); JSONL needs a pipe.
+             :connection-type 'pipe
+             :filter #'askel--rpc-filter
+             :sentinel #'askel--rpc-sentinel))))
+  askel--rpc-process)
+
+(defun askel--rpc-maybe-reset ()
+  "Bound session growth per `askel-rpc-reset-after'.
+Protocols without an in-band reset get a process restart instead."
+  (when (and (>= askel--rpc-turns askel-rpc-reset-after)
+             (process-live-p askel--rpc-process))
+    (setq askel--rpc-turns 0)
+    (if (eq askel--rpc-protocol 'pi-rpc)
+        (askel--rpc-send '((type . "new_session")))
+      (askel--rpc-kill))))
+
+(defun askel--ask-rpc (question prompt label start)
+  "Ask QUESTION (expanded to PROMPT) via the persistent agent process."
+  (askel--rpc-maybe-reset)
+  (askel--rpc-ensure-process)
+  (cl-incf askel--rpc-turns)
+  (setq askel--rpc-callback
+        (lambda (text)
+          (if (and text (not (string-empty-p text)))
+              (askel--finish question label start text)
+            (askel--show-failure "Agent failed."
+                                 "Empty reply from persistent agent."))))
+  (pcase askel--rpc-protocol
+    ('pi-rpc
+     (askel--rpc-send `((type . "prompt") (message . ,prompt))))
+    ('claude-stream-json
+     (askel--rpc-send
+      `((type . "user")
+        (message . ((role . "user")
+                    (content . [((type . "text") (text . ,prompt))]))))))))
+
+;;;###autoload
+(defun askel-stop-agent ()
+  "Stop the persistent agent process, if any."
+  (interactive)
+  (if askel--rpc-process
+      (progn (askel--rpc-kill) (message "Askel: persistent agent stopped."))
+    (message "Askel: no persistent agent running.")))
 
 (defun askel--ask-cli (question prompt label start)
   "Ask QUESTION (expanded to PROMPT) via the active CLI preset."
@@ -668,9 +848,10 @@ COMMAND is the parsed command plist, or nil.  No-op when logging is disabled."
         (start (float-time)))
     (askel--abort-pending)
     (askel--show-started question)
-    (if (askel--http-preset-p)
-        (askel--ask-http question prompt label start)
-      (askel--ask-cli question prompt label start))))
+    (cond
+     ((askel--http-preset-p) (askel--ask-http question prompt label start))
+     ((askel--rpc-preset-p) (askel--ask-rpc question prompt label start))
+     (t (askel--ask-cli question prompt label start)))))
 
 ;;;###autoload
 (defun askel-set-agent (agent)

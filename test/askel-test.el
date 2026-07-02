@@ -121,6 +121,69 @@
       (delete-file file)))
   (should (null (askel--auth-file-openrouter-key "/nonexistent/auth.json"))))
 
+;;; persistent agent (RPC) ---------------------------------------------------
+
+(ert-deftest askel-rpc-preset-selection ()
+  "Persistent mode applies only to presets with :rpc-command, when enabled."
+  (let ((askel-persistent-agent t))
+    (let ((askel-agent 'pi)) (should (askel--rpc-preset-p)))
+    (let ((askel-agent 'openrouter)) (should-not (askel--rpc-preset-p)))
+    (let ((askel-agent 'custom)) (should-not (askel--rpc-preset-p))))
+  (let ((askel-persistent-agent nil) (askel-agent 'pi))
+    (should-not (askel--rpc-preset-p))))
+
+(ert-deftest askel-rpc-command-pi ()
+  "The pi persistent command runs RPC mode with the preset's model."
+  (let ((askel-agent 'pi) (askel-model nil))
+    (should (equal (askel--rpc-command)
+                   '("pi" "--mode" "rpc" "--no-session" "--no-context-files"
+                     "--tools" "read,bash,grep,find,ls" "--thinking" "low"
+                     "--model" "z-ai/glm-5.2")))))
+
+(ert-deftest askel-rpc-pi-event-flow ()
+  "agent_end triggers a text request; its response reaches the callback."
+  (let* ((askel--rpc-protocol 'pi-rpc)
+         (sent nil)
+         (got nil)
+         (askel--rpc-callback (lambda (text) (setq got text))))
+    (cl-letf (((symbol-function 'askel--rpc-send)
+               (lambda (obj) (setq sent obj))))
+      (askel--rpc-handle-event '((type . "agent_end")))
+      (should (equal sent '((type . "get_last_assistant_text"))))
+      (askel--rpc-handle-event
+       '((type . "response")
+         (command . "get_last_assistant_text")
+         (data . ((text . "{\"answer\":\"ok\"}")))))
+      (should (equal got "{\"answer\":\"ok\"}"))
+      ;; the callback is consumed; a duplicate response is ignored
+      (should (null askel--rpc-callback)))))
+
+(ert-deftest askel-rpc-claude-event-flow ()
+  "The claude result event delivers its text; errors deliver nil."
+  (let* ((askel--rpc-protocol 'claude-stream-json)
+         (got :untouched)
+         (askel--rpc-callback (lambda (text) (setq got text))))
+    (askel--rpc-handle-event '((type . "system") (subtype . "init")))
+    (should (eq got :untouched))
+    (askel--rpc-handle-event '((type . "result") (result . "{\"answer\":\"ok\"}")))
+    (should (equal got "{\"answer\":\"ok\"}")))
+  (let* ((askel--rpc-protocol 'claude-stream-json)
+         (got :untouched)
+         (askel--rpc-callback (lambda (text) (setq got text))))
+    (askel--rpc-handle-event '((type . "result") (is_error . t) (result . "boom")))
+    (should (null got))))
+
+(ert-deftest askel-rpc-filter-reassembles-lines ()
+  "The filter handles JSON lines split across chunks and skips non-JSON."
+  (let ((askel--rpc-line-buffer "")
+        (events nil))
+    (cl-letf (((symbol-function 'askel--rpc-handle-event)
+               (lambda (ev) (push ev events))))
+      (askel--rpc-filter nil "noise\n{\"type\":\"agent")
+      (askel--rpc-filter nil "_start\"}\n{\"type\":\"agent_end\"}\n")
+      (should (equal (nreverse events)
+                     '(((type . "agent_start")) ((type . "agent_end"))))))))
+
 ;;; askel--extract-json / parse --------------------------------------------
 
 (ert-deftest askel-extract-json-plain ()
