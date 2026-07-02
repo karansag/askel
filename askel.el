@@ -13,15 +13,18 @@
 
 ;; Ask in natural language; get an executable Emacs Lisp or shell command back.
 ;;
-;; askel shells out to a CLI agent.  Choose one with `askel-agent' -- the
-;; built-in presets in `askel-agents' are `pi', `claude', and `codex' -- or set
-;; it to `custom' and provide `askel-custom-command'.  Override the model with
-;; `askel-model'.  Switch interactively with M-x `askel-set-agent' and
-;; `askel-set-model'.
+;; Choose a backend with `askel-agent'.  The default preset, `openrouter',
+;; calls the OpenRouter HTTP API directly -- roughly 10x faster than shelling
+;; out to an agent CLI, which pays for process startup, session setup, and (on
+;; OpenRouter's default routing) a slow upstream provider on every query.  The
+;; CLI presets `pi', `claude', `codex', and `opencode' remain available, or set
+;; `askel-agent' to `custom' and provide `askel-custom-command'.  Override the
+;; model with `askel-model'.  Switch interactively with M-x `askel-set-agent'
+;; and `askel-set-model'.
 ;;
-;; The default agent is `pi', so that CLI must be on your PATH; otherwise
-;; `askel-now' fails with "pi: command not found".  Each preset's command must
-;; likewise be installed for that agent to work.
+;; The `openrouter' preset needs an API key: `askel-openrouter-api-key', the
+;; OPENROUTER_API_KEY environment variable, or a key already stored by the pi
+;; or opencode CLIs.  CLI presets need their command on `exec-path'.
 ;;
 ;; Privacy: each askel sends a prefix of your `~/.emacs.el', the current buffer,
 ;; and any active region to the agent as context.
@@ -32,13 +35,18 @@
 (require 'cl-lib)
 (require 'json)
 (require 'subr-x)
+(require 'url)
 
 (defgroup askel nil
   "Ask an external agent for executable Emacs commands."
   :group 'tools)
 
 (defcustom askel-agents
-  '((pi
+  '((openrouter
+     :type http
+     :url "https://openrouter.ai/api/v1/chat/completions"
+     :model "z-ai/glm-5.2")           ; https://openrouter.ai/models
+    (pi
      :command "pi"
      :args ("--tools" "read,bash,grep,find,ls" "--thinking" "low" "--no-context-files" "-p")
      :model "z-ai/glm-5.2"         ; `pi --list-models' shows others
@@ -61,21 +69,33 @@
      :args ("run")
      :model "openrouter/z-ai/glm-5.2"   ; `opencode models' lists the rest
      :model-flag "--model"))
-  "Built-in agent CLI presets for `askel-now'.
+  "Built-in agent presets for `askel-now'.
 
-An alist mapping a preset key (symbol) to a plist with:
+An alist mapping a preset key (symbol) to a plist.  HTTP presets
+(:type `http') call an OpenAI-compatible chat-completions endpoint
+directly and take:
+  :url         endpoint URL
+  :model       model string sent in the request
+CLI presets shell out to an agent binary and take:
   :command     program to run (must be on `exec-path')
   :args        fixed arguments placed before the prompt
   :model       default model string, or nil for the agent's own default
   :model-flag  flag used to pass the model (e.g. \"--model\")
-The prompt is always appended as the final argument.  Select the active
-preset with `askel-agent'."
+For CLI presets the prompt is appended as the final argument.  Select
+the active preset with `askel-agent'."
   :type '(alist :key-type symbol :value-type plist))
 
-(defcustom askel-agent 'pi
+(defcustom askel-agent 'openrouter
   "Active agent for `askel-now'.
 Either a key in `askel-agents', or `custom' to use `askel-custom-command'."
   :type 'symbol)
+
+(defcustom askel-openrouter-api-key nil
+  "API key for the `openrouter' preset.
+When nil, fall back to the OPENROUTER_API_KEY environment variable and
+then to keys stored by the pi and opencode CLIs (~/.pi/agent/auth.json,
+~/.local/share/opencode/auth.json)."
+  :type '(choice (const :tag "Auto-discover" nil) string))
 
 (defcustom askel-model nil
   "Model override for the active agent.
@@ -117,6 +137,8 @@ Each `askel-now' response appends one entry here; view it with
 
 (defvar askel--history nil)
 (defvar askel--last-process nil)
+(defvar askel--last-url-buffer nil
+  "Buffer of the in-flight HTTP request, or nil.")
 (defvar askel--last-prompt nil)
 (defvar askel--last-response nil)
 (defvar askel--last-timing nil
@@ -322,6 +344,78 @@ insert that flag so the agent writes its final message to OUTPUT-FILE."
               (when (and out-flag output-file) (list out-flag output-file))
               (list prompt)))))
 
+(defun askel--http-preset-p ()
+  "Return non-nil when the active agent is an HTTP preset."
+  (and (not (eq askel-agent 'custom))
+       (eq (plist-get (askel--preset) :type) 'http)))
+
+(defun askel--auth-file-openrouter-key (file)
+  "Return the OpenRouter API key stored in FILE (a CLI auth.json), or nil."
+  (ignore-errors
+    (alist-get 'key
+               (alist-get 'openrouter
+                          (askel--json-object-alist
+                           (askel--read-file (expand-file-name file)))))))
+
+(defun askel--openrouter-key ()
+  "Return the OpenRouter API key, or signal a `user-error'."
+  (or askel-openrouter-api-key
+      (getenv "OPENROUTER_API_KEY")
+      (askel--auth-file-openrouter-key "~/.pi/agent/auth.json")
+      (askel--auth-file-openrouter-key "~/.local/share/opencode/auth.json")
+      (user-error
+       "No OpenRouter API key; set `askel-openrouter-api-key' or OPENROUTER_API_KEY")))
+
+(defun askel--http-body (model prompt)
+  "Return the JSON request body asking MODEL to answer PROMPT."
+  (json-encode
+   `((model . ,model)
+     (messages . [((role . "user") (content . ,prompt))])
+     ;; OpenRouter's default routing can land on providers that take 10-20s
+     ;; to prefill an askel-sized prompt; throughput-sorted routing answers
+     ;; the same prompt in 1-2s.
+     (provider . ((sort . "throughput")))
+     (reasoning . ((enabled . :json-false)))
+     (max_tokens . 1024))))
+
+(defun askel--http-response-content (data)
+  "Extract the message text from chat-completions response DATA."
+  (alist-get 'content
+             (alist-get 'message (car (alist-get 'choices data)))))
+
+(defun askel--http-request (url body callback)
+  "POST BODY (a JSON string) to URL; call CALLBACK with (CONTENT PROVIDER ERR).
+CONTENT is the model's reply or nil, PROVIDER the upstream provider name
+when reported, ERR a message describing the failure when CONTENT is nil.
+Return the buffer of the in-flight request."
+  (let ((url-request-method "POST")
+        (url-request-extra-headers
+         `(("Content-Type" . "application/json")
+           ("Authorization" . ,(concat "Bearer " (askel--openrouter-key)))))
+        (url-request-data (encode-coding-string body 'utf-8)))
+    (url-retrieve
+     url
+     (lambda (status)
+       (let* ((data (ignore-errors
+                      (progn
+                        (goto-char (or (and (boundp 'url-http-end-of-headers)
+                                            url-http-end-of-headers)
+                                       (point-min)))
+                        (askel--json-object-alist
+                         (decode-coding-string
+                          (buffer-substring-no-properties (point) (point-max))
+                          'utf-8)))))
+              (content (and data (askel--http-response-content data)))
+              (provider (and data (alist-get 'provider data)))
+              (err (unless content
+                     (or (alist-get 'message (alist-get 'error data))
+                         (and (plist-get status :error)
+                              (format "%S" (plist-get status :error)))
+                         "empty response"))))
+         (kill-buffer (current-buffer))
+         (funcall callback content provider err)))
+     nil t)))
+
 (defun askel--json-object-alist (json)
   (let ((json-object-type 'alist)
         (json-array-type 'list)
@@ -499,20 +593,48 @@ COMMAND is the parsed command plist, or nil.  No-op when logging is disabled."
         (pop-to-buffer (current-buffer)))
     (message "Askel: asking agent...")))
 
-;;;###autoload
-(defun askel-now (question)
-  "Ask QUESTION and display an executable response from the configured agent."
-  (interactive (list (read-string "Askel: ")))
-  (setq askel--last-prompt question)
-  (let* ((prompt (askel--build-prompt question))
-         (output "")
+(defun askel--abort-pending ()
+  "Cancel any in-flight agent request."
+  (when (process-live-p askel--last-process)
+    (delete-process askel--last-process))
+  (when (buffer-live-p askel--last-url-buffer)
+    (let ((proc (get-buffer-process askel--last-url-buffer)))
+      (when proc (delete-process proc)))
+    (kill-buffer askel--last-url-buffer))
+  (setq askel--last-url-buffer nil))
+
+(defun askel--show-failure (headline detail)
+  "Show HEADLINE and DETAIL in the `*askel*' buffer."
+  (with-current-buffer (askel--buffer)
+    (let ((inhibit-read-only t))
+      (erase-buffer)
+      (insert headline "\n\n" detail))
+    (pop-to-buffer (current-buffer))))
+
+(defun askel--finish (question label start raw &optional provider)
+  "Record timing for QUESTION and display RAW, the agent's reply."
+  (setq askel--last-timing
+        (format "%s · %.1fs%s" label (- (float-time) start)
+                (if provider (format " (%s)" provider) "")))
+  (askel--handle-response question raw))
+
+(defun askel--ask-http (question prompt label start)
+  "Ask QUESTION (expanded to PROMPT) via the active HTTP preset."
+  (let ((preset (askel--preset)))
+    (setq askel--last-url-buffer
+          (askel--http-request
+           (plist-get preset :url)
+           (askel--http-body (or askel-model (plist-get preset :model)) prompt)
+           (lambda (content provider err)
+             (if content
+                 (askel--finish question label start content provider)
+               (askel--show-failure "Agent failed." err)))))))
+
+(defun askel--ask-cli (question prompt label start)
+  "Ask QUESTION (expanded to PROMPT) via the active CLI preset."
+  (let* ((output "")
          (out-file (and (askel--output-file-flag) (make-temp-file "askel-out")))
-         (command (askel--command-list prompt out-file))
-         (label (askel--agent-label))
-         (start (float-time)))
-    (when (process-live-p askel--last-process)
-      (delete-process askel--last-process))
-    (askel--show-started question)
+         (command (askel--command-list prompt out-file)))
     (setq askel--last-process
           (make-process
            :name "askel-agent"
@@ -525,23 +647,30 @@ COMMAND is the parsed command plist, or nil.  No-op when logging is disabled."
                        (when (memq (process-status proc) '(exit signal))
                          (unwind-protect
                              (if (= (process-exit-status proc) 0)
-                                 (progn
-                                   (setq askel--last-timing
-                                         (format "%s · %.1fs" label
-                                                 (- (float-time) start)))
-                                   (askel--handle-response
-                                    question
-                                    (or (and out-file (askel--read-file out-file))
-                                        output)))
-                               (with-current-buffer (askel--buffer)
-                                 (let ((inhibit-read-only t))
-                                   (erase-buffer)
-                                   (insert "Agent failed.\n\n")
-                                   (insert "Command: "
-                                           (mapconcat #'identity command " ")
-                                           "\n\n")
-                                   (insert output))))
+                                 (askel--finish
+                                  question label start
+                                  (or (and out-file (askel--read-file out-file))
+                                      output))
+                               (askel--show-failure
+                                "Agent failed."
+                                (concat "Command: "
+                                        (mapconcat #'identity command " ")
+                                        "\n\n" output)))
                            (when out-file (ignore-errors (delete-file out-file))))))))))
+
+;;;###autoload
+(defun askel-now (question)
+  "Ask QUESTION and display an executable response from the configured agent."
+  (interactive (list (read-string "Askel: ")))
+  (setq askel--last-prompt question)
+  (let ((prompt (askel--build-prompt question))
+        (label (askel--agent-label))
+        (start (float-time)))
+    (askel--abort-pending)
+    (askel--show-started question)
+    (if (askel--http-preset-p)
+        (askel--ask-http question prompt label start)
+      (askel--ask-cli question prompt label start))))
 
 ;;;###autoload
 (defun askel-set-agent (agent)

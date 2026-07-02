@@ -8,7 +8,7 @@ shell command that you read and confirm before it runs.
 ```
 M-x askel-now RET  split the window and open my init file RET
 
-  claude/sonnet · 4.9s
+  openrouter/z-ai/glm-5.2 · 1.8s (Wafer)
   Splits the window and opens your Emacs init file.
   Run (elisp): (progn (split-window-right) (find-file user-init-file))
   [y] run  [e] edit  [b] buffer  [n] no:
@@ -17,12 +17,15 @@ M-x askel-now RET  split the window and open my init file RET
 ## Features
 
 - **Natural language → a real command**, shown before it runs.
-- **Pluggable agents.** Built-in presets for `pi`, `claude`, `codex`, and
-  `opencode`; switch agent and model on the fly, or plug in your own CLI.
+- **Pluggable agents.** Default preset `openrouter` calls the OpenRouter API
+  directly over HTTP for fast replies; built-in CLI presets for `pi`, `claude`,
+  `codex`, and `opencode` are also available. Switch agent and model on the
+  fly, or plug in your own CLI.
 - **Follow-ups with history.** Ask a follow-up and the previous exchange is
   included as context.
 - **Confirm-before-run.** Run, edit-then-run, inspect, or skip every command.
-- **Per-query timing** (`agent/model · N.Ns`) so you can compare agents.
+- **Per-query timing** (`agent/model · N.Ns`, plus the upstream provider for
+  HTTP presets) so you can compare agents.
 
 ## Install
 
@@ -46,19 +49,52 @@ With `use-package`:
 
 ## Agents
 
-askel shells out to a CLI agent. Whichever preset is active, that CLI must be
+The default preset, `openrouter`, calls the [OpenRouter](https://openrouter.ai)
+chat-completions API directly over HTTP from Emacs (`url-retrieve`) — no CLI
+subprocess. The remaining presets shell out to an agent CLI, which must be
 installed and on Emacs's `exec-path`.
 
 | Agent | `askel-agent` | Default model | Notes |
 |-------|---------------|---------------|-------|
-| Pi (default) | `pi` | `z-ai/glm-5.2` | tool-enabled agent; `pi --list-models` lists others |
+| OpenRouter (default) | `openrouter` | `z-ai/glm-5.2` | direct HTTP call, no CLI needed; see below |
+| Pi | `pi` | `z-ai/glm-5.2` | tool-enabled agent; `pi --list-models` lists others |
 | Claude | `claude` | `sonnet` | set `askel-model` to `haiku` for lower latency |
 | Codex | `codex` | `gpt-5.4` | `codex exec`, low reasoning; reads the reply via `--output-last-message` |
 | OpenCode | `opencode` | `openrouter/z-ai/glm-5.2` | `opencode run`; `opencode models` lists others |
 
-All four presets are verified working end-to-end.
+All five presets are verified working end-to-end.
 
-If an agent lives outside your default `PATH` (e.g. OpenCode under
+### Why openrouter is the default
+
+Benchmarked against an askel-sized prompt (~23.5k chars), the CLI agents cost
+20-26s per query (pi: 20.3s, `claude -p` with haiku: 26.4s), dominated by
+process boot, session setup, and other agentic overhead. Calling OpenRouter's
+API directly took 1.4-10s in testing, depending on which upstream provider
+serves the request — still 2-10x faster. The request body sends
+`provider: {sort: "throughput"}` and `reasoning: {enabled: false}`, since
+OpenRouter's default routing can otherwise land on a provider that takes
+10-20s just to prefill the prompt.
+
+For consistently low latency, switch the model (`M-x askel-set-model`):
+`google/gemini-2.5-flash` and `anthropic/claude-haiku-4.5` both answered in
+1.4-2.5s in testing.
+
+### OpenRouter API key
+
+The `openrouter` preset looks for a key in this order, so most people need no
+setup:
+
+1. `askel-openrouter-api-key`, if set
+2. the `OPENROUTER_API_KEY` environment variable
+3. a key already stored by the `pi` CLI (`~/.pi/agent/auth.json`)
+4. a key already stored by `opencode` (`~/.local/share/opencode/auth.json`)
+
+If none of those resolve, `askel-now` signals a `user-error` telling you to
+set `askel-openrouter-api-key` or `OPENROUTER_API_KEY`.
+
+### CLI presets
+
+If a CLI agent lives outside your default `PATH` (e.g. OpenCode under
 `~/.opencode/bin`), add it to `exec-path`:
 
 ```elisp
@@ -118,7 +154,7 @@ Switch agent and model interactively (`askel-set-agent` / `askel-set-model`) or
 set the variables in your init:
 
 ```elisp
-(setq askel-agent 'claude)   ; pi | claude | codex | opencode | custom
+(setq askel-agent 'claude)   ; openrouter | pi | claude | codex | opencode | custom
 (setq askel-model "haiku")   ; nil = use the active preset's default model
 ```
 
@@ -130,16 +166,18 @@ is appended as the final argument:
       askel-custom-command '("my-agent" "--model" "foo" "-p"))
 ```
 
-Add or edit presets directly in `askel-agents`. Each preset is a plist with
-`:command`, `:args`, `:model`, `:model-flag`, and optionally `:output-file-flag`
-(for agents whose stdout is too noisy to parse — the final message is read from
-a file instead).
+Add or edit presets directly in `askel-agents`. HTTP presets (`:type http`)
+are a plist with `:url` and `:model`; CLI presets are a plist with `:command`,
+`:args`, `:model`, `:model-flag`, and optionally `:output-file-flag` (for
+agents whose stdout is too noisy to parse — the final message is read from a
+file instead).
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `askel-agent` | `pi` | active agent preset, or `custom` |
+| `askel-agent` | `openrouter` | active agent preset, or `custom` |
 | `askel-model` | `nil` | model override for the active agent |
-| `askel-agents` | (4 presets) | the preset definitions |
+| `askel-openrouter-api-key` | `nil` | API key for the `openrouter` preset; auto-discovered when nil |
+| `askel-agents` | (5 presets) | the preset definitions |
 | `askel-custom-command` | `nil` | command list for the `custom` agent |
 | `askel-display-mode` | `minibuffer` | `minibuffer` or `buffer` |
 | `askel-log-buffer` | `*askel-log*` | running query log; nil to disable |
@@ -149,9 +187,12 @@ a file instead).
 
 ## How it works
 
-askel builds a prompt (your request + Emacs context), runs the agent CLI with
-it, and asks the agent to reply as JSON describing a single command. It parses
-that, shows you the command, and runs it only when you confirm.
+askel builds a prompt (your request + Emacs context) and sends it to the
+active agent, asking it to reply as JSON describing a single command. For the
+default `openrouter` preset that's a direct HTTP call to OpenRouter's
+chat-completions API; for the CLI presets it's a subprocess call to the agent
+CLI. Either way, askel parses the JSON reply, shows you the command, and runs
+it only when you confirm.
 
 ## Safety
 
@@ -161,7 +202,9 @@ shown and confirmed before it executes — read it before you accept.
 ## Privacy
 
 Each query sends a prefix of your `~/.emacs.el`, the current buffer, and any
-active region to the agent as context. Lower or zero out
+active region as context. With the default `openrouter` preset this goes
+directly to OpenRouter's API; with a CLI preset it goes to that CLI (which may
+have its own upstream provider). Lower or zero out
 `askel-context-max-config-chars` / `askel-context-max-buffer-chars` to bound or
 disable this.
 

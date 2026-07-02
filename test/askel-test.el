@@ -82,6 +82,45 @@
   (let ((askel-agent 'custom) (askel-custom-command nil))
     (should-error (askel--command-list "PROMPT") :type 'user-error)))
 
+;;; openrouter HTTP preset --------------------------------------------------
+
+(ert-deftest askel-default-agent-is-http ()
+  "The default agent is the direct-HTTP openrouter preset."
+  (should (eq (default-value 'askel-agent) 'openrouter))
+  (let ((askel-agent 'openrouter))
+    (should (askel--http-preset-p)))
+  (let ((askel-agent 'pi))
+    (should-not (askel--http-preset-p)))
+  (let ((askel-agent 'custom))
+    (should-not (askel--http-preset-p))))
+
+(ert-deftest askel-http-body-shape ()
+  "The request body carries the model, prompt, and fast-provider routing."
+  (let ((body (askel--json-object-alist (askel--http-body "m/x" "PROMPT"))))
+    (should (equal (alist-get 'model body) "m/x"))
+    (should (equal (alist-get 'content (car (alist-get 'messages body)))
+                   "PROMPT"))
+    (should (equal (alist-get 'sort (alist-get 'provider body)) "throughput"))
+    (should (null (alist-get 'enabled (alist-get 'reasoning body))))))
+
+(ert-deftest askel-http-response-content ()
+  "Message text is read from choices[0].message.content."
+  (let ((data (askel--json-object-alist
+               "{\"choices\":[{\"message\":{\"content\":\"hi\"}}],\"provider\":\"Wafer\"}")))
+    (should (equal (askel--http-response-content data) "hi"))
+    (should (equal (alist-get 'provider data) "Wafer"))))
+
+(ert-deftest askel-openrouter-key-sources ()
+  "The key comes from the defcustom first, then a CLI auth file."
+  (let ((askel-openrouter-api-key "sk-custom"))
+    (should (equal (askel--openrouter-key) "sk-custom")))
+  (let ((file (make-temp-file "askel-auth" nil ".json"
+                              "{\"openrouter\":{\"type\":\"api_key\",\"key\":\"sk-file\"}}")))
+    (unwind-protect
+        (should (equal (askel--auth-file-openrouter-key file) "sk-file"))
+      (delete-file file)))
+  (should (null (askel--auth-file-openrouter-key "/nonexistent/auth.json"))))
+
 ;;; askel--extract-json / parse --------------------------------------------
 
 (ert-deftest askel-extract-json-plain ()
