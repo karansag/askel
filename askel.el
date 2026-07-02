@@ -49,7 +49,19 @@
   '((openrouter
      :type http
      :url "https://openrouter.ai/api/v1/chat/completions"
-     :model "z-ai/glm-5.2")           ; https://openrouter.ai/models
+     :model "z-ai/glm-5.2"            ; https://openrouter.ai/models
+     :key askel--openrouter-key
+     ;; OpenRouter's default routing can land on providers that take
+     ;; 10-20s to prefill an askel-sized prompt; throughput-sorted
+     ;; routing answers the same prompt in 1-2s.
+     :body-extra ((provider . ((sort . "throughput")))
+                  (reasoning . ((enabled . :json-false)))))
+    (local
+     :type http
+     ;; llama-server's default address; for Ollama use
+     ;; "http://localhost:11434/v1/chat/completions" and set :model.
+     :url "http://localhost:8080/v1/chat/completions"
+     :model nil)                      ; nil = whatever model the server loaded
     (pi
      :command "pi"
      :args ("--tools" "read,bash,grep,find,ls" "--thinking" "low" "--no-context-files" "-p")
@@ -88,7 +100,11 @@ An alist mapping a preset key (symbol) to a plist.  HTTP presets
 (:type `http') call an OpenAI-compatible chat-completions endpoint
 directly and take:
   :url         endpoint URL
-  :model       model string sent in the request
+  :model       model string sent in the request, or nil to omit it
+               (local servers answer with whatever model they loaded)
+  :key         bearer token: a string, a function returning one, or nil
+               for servers that need no auth
+  :body-extra  alist of extra request-body fields
 CLI presets shell out to an agent binary and take:
   :command      program to run (must be on `exec-path')
   :args         fixed arguments placed before the prompt
@@ -408,35 +424,40 @@ insert that flag so the agent writes its final message to OUTPUT-FILE."
       (user-error
        "No OpenRouter API key; set `askel-openrouter-api-key' or OPENROUTER_API_KEY")))
 
-(defun askel--http-body (model prompt)
-  "Return the JSON request body asking MODEL to answer PROMPT."
-  (json-encode
-   `((model . ,model)
-     (messages . [((role . "user") (content . ,prompt))])
-     ;; OpenRouter's default routing can land on providers that take 10-20s
-     ;; to prefill an askel-sized prompt; throughput-sorted routing answers
-     ;; the same prompt in 1-2s.
-     (provider . ((sort . "throughput")))
-     (reasoning . ((enabled . :json-false)))
-     (max_tokens . 1024))))
+(defun askel--http-key (preset)
+  "Return PRESET's bearer token, or nil when the endpoint needs no auth."
+  (let ((key (plist-get preset :key)))
+    (if (functionp key) (funcall key) key)))
+
+(defun askel--http-body (preset prompt)
+  "Return the JSON request body asking PRESET's model to answer PROMPT."
+  (let ((model (or askel-model (plist-get preset :model))))
+    (json-encode
+     (append
+      (when model `((model . ,model)))
+      `((messages . [((role . "user") (content . ,prompt))])
+        (max_tokens . 1024))
+      (plist-get preset :body-extra)))))
 
 (defun askel--http-response-content (data)
   "Extract the message text from chat-completions response DATA."
   (alist-get 'content
              (alist-get 'message (car (alist-get 'choices data)))))
 
-(defun askel--http-request (url body callback)
-  "POST BODY (a JSON string) to URL; call CALLBACK with (CONTENT PROVIDER ERR).
+(defun askel--http-request (preset prompt callback)
+  "POST PROMPT to PRESET's endpoint; call CALLBACK with (CONTENT PROVIDER ERR).
 CONTENT is the model's reply or nil, PROVIDER the upstream provider name
 when reported, ERR a message describing the failure when CONTENT is nil.
 Return the buffer of the in-flight request."
-  (let ((url-request-method "POST")
-        (url-request-extra-headers
-         `(("Content-Type" . "application/json")
-           ("Authorization" . ,(concat "Bearer " (askel--openrouter-key)))))
-        (url-request-data (encode-coding-string body 'utf-8)))
+  (let* ((key (askel--http-key preset))
+         (url-request-method "POST")
+         (url-request-extra-headers
+          `(("Content-Type" . "application/json")
+            ,@(when key `(("Authorization" . ,(concat "Bearer " key))))))
+         (url-request-data
+          (encode-coding-string (askel--http-body preset prompt) 'utf-8)))
     (url-retrieve
-     url
+     (plist-get preset :url)
      (lambda (status)
        (let* ((data (ignore-errors
                       (progn
@@ -666,15 +687,13 @@ be respawned by the next query."
 
 (defun askel--ask-http (question prompt label start)
   "Ask QUESTION (expanded to PROMPT) via the active HTTP preset."
-  (let ((preset (askel--preset)))
-    (setq askel--last-url-buffer
-          (askel--http-request
-           (plist-get preset :url)
-           (askel--http-body (or askel-model (plist-get preset :model)) prompt)
-           (lambda (content provider err)
-             (if content
-                 (askel--finish question label start content provider)
-               (askel--show-failure "Agent failed." err)))))))
+  (setq askel--last-url-buffer
+        (askel--http-request
+         (askel--preset) prompt
+         (lambda (content provider err)
+           (if content
+               (askel--finish question label start content provider)
+             (askel--show-failure "Agent failed." err))))))
 
 (defun askel--rpc-preset-p ()
   "Return non-nil when the active agent should run as a persistent process."

@@ -94,14 +94,38 @@
   (let ((askel-agent 'custom))
     (should-not (askel--http-preset-p))))
 
-(ert-deftest askel-http-body-shape ()
-  "The request body carries the model, prompt, and fast-provider routing."
-  (let ((body (askel--json-object-alist (askel--http-body "m/x" "PROMPT"))))
-    (should (equal (alist-get 'model body) "m/x"))
+(ert-deftest askel-http-body-openrouter ()
+  "The openrouter body carries model, prompt, and fast-provider routing."
+  (let* ((askel-agent 'openrouter) (askel-model nil)
+         (body (askel--json-object-alist
+                (askel--http-body (askel--preset) "PROMPT"))))
+    (should (equal (alist-get 'model body) "z-ai/glm-5.2"))
     (should (equal (alist-get 'content (car (alist-get 'messages body)))
                    "PROMPT"))
     (should (equal (alist-get 'sort (alist-get 'provider body)) "throughput"))
     (should (null (alist-get 'enabled (alist-get 'reasoning body))))))
+
+(ert-deftest askel-http-body-local ()
+  "The local preset omits model, auth, and OpenRouter-only fields."
+  (let* ((askel-agent 'local) (askel-model nil)
+         (preset (askel--preset))
+         (body (askel--json-object-alist (askel--http-body preset "PROMPT"))))
+    (should-not (assq 'model body))
+    (should-not (assq 'provider body))
+    (should (equal (alist-get 'content (car (alist-get 'messages body)))
+                   "PROMPT"))
+    (should (null (askel--http-key preset))))
+  ;; askel-model still applies, e.g. for Ollama
+  (let* ((askel-agent 'local) (askel-model "qwen3:8b")
+         (body (askel--json-object-alist
+                (askel--http-body (askel--preset) "PROMPT"))))
+    (should (equal (alist-get 'model body) "qwen3:8b"))))
+
+(ert-deftest askel-http-key-forms ()
+  "A :key may be a literal string, a function, or absent."
+  (should (equal (askel--http-key '(:key "sk-lit")) "sk-lit"))
+  (should (equal (askel--http-key `(:key ,(lambda () "sk-fn"))) "sk-fn"))
+  (should (null (askel--http-key '(:url "x")))))
 
 (ert-deftest askel-http-response-content ()
   "Message text is read from choices[0].message.content."
